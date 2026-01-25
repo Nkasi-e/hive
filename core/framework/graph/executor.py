@@ -201,6 +201,7 @@ class GraphExecutor:
         self.logger.info(f"   Goal: {goal.description}")
         self.logger.info(f"   Entry node: {graph.entry_node}")
 
+        current_node_spec: NodeSpec | None = None
         try:
             while steps < graph.max_steps:
                 steps += 1
@@ -209,6 +210,8 @@ class GraphExecutor:
                 node_spec = graph.get_node(current_node_id)
                 if node_spec is None:
                     raise RuntimeError(f"Node not found: {current_node_id}")
+                
+                current_node_spec = node_spec  # Keep reference for error handling
 
                 path.append(current_node_id)
 
@@ -230,6 +233,32 @@ class GraphExecutor:
                     input_data=input_data or {},
                 )
 
+                # Validate required inputs are present before execution
+                missing_inputs = []
+                provided_inputs = []
+                for key in node_spec.input_keys:
+                    value = memory.read(key)
+                    if value is None:
+                        missing_inputs.append(key)
+                    else:
+                        provided_inputs.append(key)
+
+                if missing_inputs:
+                    # Build detailed error message
+                    available_keys = list(memory.read_all().keys())
+                    error_msg = self._format_missing_inputs_error(
+                        node_spec=node_spec,
+                        missing=missing_inputs,
+                        provided=provided_inputs,
+                        available=available_keys,
+                    )
+                    self.logger.error(f"   ✗ {error_msg}")
+                    self.runtime.report_problem(
+                        severity="critical",
+                        description=error_msg,
+                    )
+                    raise ValueError(error_msg)
+
                 # Log actual input data being read
                 if node_spec.input_keys:
                     self.logger.info("   Reading from memory:")
@@ -245,7 +274,7 @@ class GraphExecutor:
                 # Get or create node implementation
                 node_impl = self._get_node_implementation(node_spec)
 
-                # Validate inputs
+                # Validate inputs (additional validation beyond presence check)
                 validation_errors = node_impl.validate_input(ctx)
                 if validation_errors:
                     self.logger.warning(f"⚠ Validation warnings: {validation_errors}")
@@ -308,11 +337,26 @@ class GraphExecutor:
                         self.logger.info(f"   ↻ Retrying ({node_retry_counts[current_node_id]}/{max_retries_per_node})...")
                         continue
                     else:
-                        # Max retries exceeded - fail the execution
-                        self.logger.error(f"   ✗ Max retries ({max_retries_per_node}) exceeded for node {current_node_id}")
+                        # Max retries exceeded - fail the execution with enhanced context
+                        memory_snapshot = self._get_memory_snapshot(memory)
+                        provided_inputs = {k: memory.read(k) for k in node_spec.input_keys}
+                        
+                        error_msg = (
+                            f"Node '{node_spec.name}' failed after {max_retries_per_node} attempts\n"
+                            f"  Error: {result.error}\n"
+                            f"  Node Type: {node_spec.node_type}\n"
+                            f"  Node ID: {node_spec.id}\n"
+                            f"  Inputs Expected: {node_spec.input_keys}\n"
+                            f"  Inputs Provided: {list(provided_inputs.keys())}\n"
+                            f"  Memory State (keys): {list(memory_snapshot.keys())}\n"
+                            f"  Output Keys Expected: {node_spec.output_keys}\n"
+                            f"  Execution Path: {' → '.join(path)}"
+                        )
+                        
+                        self.logger.error(f"   ✗ {error_msg}")
                         self.runtime.report_problem(
                             severity="critical",
-                            description=f"Node {current_node_id} failed after {max_retries_per_node} attempts: {result.error}",
+                            description=error_msg,
                         )
                         self.runtime.end_run(
                             success=False,
@@ -321,7 +365,7 @@ class GraphExecutor:
                         )
                         return ExecutionResult(
                             success=False,
-                            error=f"Node '{node_spec.name}' failed after {max_retries_per_node} attempts: {result.error}",
+                            error=error_msg,
                             output=memory.read_all(),
                             steps_executed=steps,
                             total_tokens=total_tokens,
@@ -413,17 +457,27 @@ class GraphExecutor:
             )
 
         except Exception as e:
+            # Build enhanced error message with context
+            error_msg = self._format_execution_error(
+                error=e,
+                node_spec=current_node_spec,
+                memory=memory,
+                path=path,
+                steps=steps,
+            )
+            
+            self.logger.error(f"\n❌ Execution failed:\n{error_msg}")
             self.runtime.report_problem(
                 severity="critical",
-                description=str(e),
+                description=error_msg,
             )
             self.runtime.end_run(
                 success=False,
-                narrative=f"Failed at step {steps}: {e}",
+                narrative=f"Failed at step {steps}: {error_msg}",
             )
             return ExecutionResult(
                 success=False,
-                error=str(e),
+                error=error_msg,
                 steps_executed=steps,
                 path=path,
             )
@@ -520,15 +574,31 @@ class GraphExecutor:
         for edge in edges:
             target_node_spec = graph.get_node(edge.target)
 
-            if edge.should_traverse(
-                source_success=result.success,
-                source_output=result.output,
-                memory=memory.read_all(),
-                llm=self.llm,
-                goal=goal,
-                source_node_name=current_node_spec.name if current_node_spec else current_node_id,
-                target_node_name=target_node_spec.name if target_node_spec else edge.target,
-            ):
+            try:
+                should_traverse = edge.should_traverse(
+                    source_success=result.success,
+                    source_output=result.output,
+                    memory=memory.read_all(),
+                    llm=self.llm,
+                    goal=goal,
+                    source_node_name=current_node_spec.name if current_node_spec else current_node_id,
+                    target_node_name=target_node_spec.name if target_node_spec else edge.target,
+                )
+            except ValueError as e:
+                # Edge condition evaluation failed with detailed error
+                # The error message is already detailed from edge.py
+                raise
+            except Exception as e:
+                # Unexpected error during edge evaluation
+                error_msg = (
+                    f"Unexpected error evaluating edge '{edge.id}': {type(e).__name__}: {str(e)}\n"
+                    f"  Source: '{edge.source}' → Target: '{edge.target}'\n"
+                    f"  Condition: {edge.condition}"
+                )
+                self.logger.error(f"   ✗ {error_msg}")
+                raise RuntimeError(error_msg) from e
+
+            if should_traverse:
                 # Validate and clean output before mapping inputs
                 if self.cleansing_config.enabled and target_node_spec:
                     output_to_validate = result.output
@@ -590,3 +660,62 @@ class GraphExecutor:
     def register_function(self, node_id: str, func: Callable) -> None:
         """Register a function as a node."""
         self.node_registry[node_id] = FunctionNode(func)
+
+    def _format_missing_inputs_error(
+        self,
+        node_spec: NodeSpec,
+        missing: list[str],
+        provided: list[str],
+        available: list[str],
+    ) -> str:
+        """Format a helpful error message for missing inputs."""
+        return (
+            f"Node '{node_spec.id}' failed: Missing required inputs\n"
+            f"  Expected: {node_spec.input_keys}\n"
+            f"  Provided: {provided}\n"
+            f"  Missing: {missing}\n"
+            f"  Available in memory: {available}\n"
+            f"  Hint: Ensure previous nodes produce the missing keys or add them to input_data"
+        )
+
+    def _get_memory_snapshot(self, memory: SharedMemory, max_length: int = 200) -> dict[str, str]:
+        """Get a readable snapshot of memory state for debugging."""
+        snapshot = {}
+        for key, value in memory.read_all().items():
+            value_str = str(value)
+            if len(value_str) > max_length:
+                value_str = value_str[:max_length] + f"... ({len(value_str)} chars)"
+            snapshot[key] = value_str
+        return snapshot
+
+    def _format_execution_error(
+        self,
+        error: Exception,
+        node_spec: NodeSpec | None,
+        memory: SharedMemory,
+        path: list[str],
+        steps: int,
+    ) -> str:
+        """Format an enhanced error message with execution context."""
+        error_msg = f"Execution failed: {type(error).__name__}: {str(error)}"
+        
+        if node_spec:
+            memory_snapshot = self._get_memory_snapshot(memory)
+            provided_inputs = {k: memory.read(k) for k in node_spec.input_keys}
+            
+            error_msg += (
+                f"\n  Node Type: {node_spec.node_type}\n"
+                f"  Node ID: {node_spec.id}\n"
+                f"  Node Name: {node_spec.name}\n"
+                f"  Inputs Expected: {node_spec.input_keys}\n"
+                f"  Inputs Provided: {list(provided_inputs.keys())}\n"
+                f"  Memory State (keys): {list(memory_snapshot.keys())}\n"
+                f"  Output Keys Expected: {node_spec.output_keys}\n"
+            )
+        
+        error_msg += (
+            f"  Execution Path: {' → '.join(path)}\n"
+            f"  Steps Executed: {steps}"
+        )
+        
+        return error_msg

@@ -173,13 +173,49 @@ class EdgeSpec(BaseModel):
             # Safe evaluation (in production, use a proper expression evaluator)
             return bool(eval(self.condition_expr, {"__builtins__": {}}, context))
         except Exception as e:
-            # Log the error for debugging
+            # Build detailed error message with context
             import logging
             logger = logging.getLogger(__name__)
-            logger.warning(f"      ⚠ Condition evaluation failed: {self.condition_expr}")
-            logger.warning(f"         Error: {e}")
-            logger.warning(f"         Available context keys: {list(context.keys())}")
-            return False
+            
+            # Extract available keys from context
+            available_output_keys = list(output.keys()) if isinstance(output, dict) else []
+            available_memory_keys = list(memory.keys()) if isinstance(memory, dict) else []
+            all_context_keys = list(context.keys())
+            
+            # Build error message
+            error_msg = (
+                f"Edge '{self.id}' condition evaluation failed\n"
+                f"  Expression: \"{self.condition_expr}\"\n"
+                f"  Error: {type(e).__name__}: {str(e)}\n"
+                f"  Available in output: {available_output_keys}\n"
+                f"  Available in memory: {available_memory_keys}\n"
+                f"  All context keys: {all_context_keys}\n"
+                f"  Source: '{self.source}' → Target: '{self.target}'"
+            )
+            
+            # Add suggestions based on common errors
+            suggestions = []
+            if isinstance(e, KeyError):
+                missing_key = str(e).strip("'\"")
+                if missing_key in available_memory_keys:
+                    suggestions.append(f"Did you mean 'memory.{missing_key}' instead of 'output.{missing_key}'?")
+                elif missing_key in available_output_keys:
+                    suggestions.append(f"Did you mean 'output.{missing_key}'?")
+                else:
+                    # Check for similar keys
+                    similar_keys = [k for k in all_context_keys if missing_key.lower() in k.lower() or k.lower() in missing_key.lower()]
+                    if similar_keys:
+                        suggestions.append(f"Did you mean one of: {similar_keys}?")
+            
+            if suggestions:
+                error_msg += f"\n  Suggestions:\n"
+                for suggestion in suggestions:
+                    error_msg += f"    - {suggestion}\n"
+            
+            logger.error(f"      ✗ {error_msg}")
+            
+            # Raise error instead of silently returning False
+            raise ValueError(error_msg) from e
 
     def _llm_decide(
         self,
